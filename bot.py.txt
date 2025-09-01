@@ -1,0 +1,83 @@
+from flask import Flask
+import threading, os, cv2, numpy as np
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+
+app = Flask(__name__)
+user_timeframes = {}
+
+def estimar_duracao(timeframe, velas_count):
+    minutos = {'1m':1,'5m':5,'15m':15}.get(timeframe,1)
+    return f"{velas_count * minutos} min ({velas_count} vela{'s' if velas_count>1 else ''})"
+
+def analisar_imagem(path, timeframe='1m'):
+    img = cv2.imread(path)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    v_inf, v_sup = np.array([40,50,50]), np.array([90,255,255])
+    r_inf1, r_sup1 = np.array([0,50,50]), np.array([10,255,255])
+    r_inf2, r_sup2 = np.array([160,50,50]), np.array([180,255,255])
+    mv = cv2.inRange(hsv, v_inf, v_sup)
+    mr = cv2.inRange(hsv, r_inf1, r_sup1) | cv2.inRange(hsv, r_inf2, r_sup2)
+    contours, _ = cv2.findContours(mv|mr, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    velas = []
+    for c in contours:
+        x,y,w,h = cv2.boundingRect(c)
+        if h>20 and w<50:
+            cor = "verde" if np.mean(mv[y:y+h, x:x+w])>0 else "vermelho"
+            velas.append((x,y,h,cor))
+    if not velas:
+        return "❌ Nenhuma vela detectada. Envie imagem mais limpa."
+
+    velas = sorted(velas, key=lambda v: v[0])[-5:]
+    verdes = sum(1 for v in velas if v[3]=="verde")
+    vermelhas = sum(1 for v in velas if v[3]=="vermelho")
+
+    if verdes >= 4:
+        d, dur = "ALTA", estimar_duracao(timeframe, verdes)
+    elif vermelhas >= 4:
+        d, dur = "BAIXA", estimar_duracao(timeframe, vermelhas)
+    else:
+        d, dur = "LATERAL", "5‑10 min (1‑2 velas)"
+
+    return f"📊 Análise ({timeframe}):\n🔺 Direção provável: {d}\n⏳ Duração estimada: {dur}\n\n⚠️ Estimativa automatizada — confirme com outros indicadores."
+
+@app.route("/")
+def home():
+    return "Bot is running!"
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Olá! Envie o timeframe (1m, 5m, 15m) antes da imagem.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.message.chat_id
+    tf = update.message.text.strip().lower()
+    if tf in ['1m','5m','15m']:
+        user_timeframes[chat] = tf
+        await update.message.reply_text(f"Timeframe definido: {tf}\nAgora envie a imagem.")
+    else:
+        await update.message.reply_text("Timeframe inválido. Envie 1m, 5m ou 15m.")
+
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.message.chat_id
+    if chat not in user_timeframes:
+        await update.message.reply_text("Envie o timeframe antes da imagem (ex: 5m).")
+        return
+    tf = user_timeframes[chat]
+    photo = update.message.photo[-1]
+    path = f"./grafico_{chat}.png"
+    await photo.get_file().download_to_drive(path)
+    res = analisar_imagem(path, tf)
+    await update.message.reply_text(res)
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask).start()
+    token = os.environ["TELEGRAM_TOKEN"]
+    bot_app = ApplicationBuilder().token(token).build()
+    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    bot_app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    bot_app.add_handler(MessageHandler(filters.COMMAND, start))
+    bot_app.run_polling()
